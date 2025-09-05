@@ -1,0 +1,20 @@
+#pragma kernel BuildVertices
+
+RWStructuredBuffer<float3> _Positions;
+Texture2D<float2> _HeightRG;
+
+int _VertsPerSide;
+float _TileSizeMeters;
+float _HeightScale;
+float _HeightOffset;
+
+[numthreads(8,8,1)]
+void BuildVertices(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VertsPerSide || id.y >= _VertsPerSide) return;
+    uint idx = id.y * _VertsPerSide + id.x;
+    float2 uv = (float2(id.xy)) / (float)(_VertsPerSide - 1);
+    float h = _HeightRG.Load(int3(uv * _TileSizeMeters,0)).x; // expect R
+    float3 p = float3(uv.x * _TileSizeMeters, h * _HeightScale + _HeightOffset, uv.y * _TileSizeMeters);
+    _Positions[idx] = p;
+}

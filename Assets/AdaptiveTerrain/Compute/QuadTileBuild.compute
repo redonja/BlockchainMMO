@@ -1,0 +1,202 @@
+#pragma kernel DecideNodeStride
+#pragma kernel BuildNodeVertices
+#pragma kernel BuildNodeIndicesAndArgs
+
+RWStructuredBuffer<uint> _Stride;
+
+Texture2D<float2> _HeightRG;
+SamplerState sampLinear { Filter=MIN_MAG_MIP_LINEAR; AddressU=Clamp; AddressV=Clamp; };
+
+RWStructuredBuffer<float3> _Positions;
+RWStructuredBuffer<float3> _Normals;
+RWStructuredBuffer<uint>   _Indices;
+RWStructuredBuffer<uint>   _Args;
+
+int _VertsPerSide;
+float _NodeSize;
+float _HeightScale;
+float _HeightOffset;
+
+float4 _NodeUVMin;
+float4 _NodeUVMax;
+
+int _EnableSkirts;
+float _SkirtHeight;
+
+int _GradientBoost;
+float2 _GradientBoostThresholds;
+
+int _UseForcedStride;
+int _ForceStride;
+
+[numthreads(1,1,1)]
+void DecideNodeStride(uint3 id : SV_DispatchThreadID)
+{
+    int stride = (_UseForcedStride!=0) ? max(1,_ForceStride) : 1;
+
+    if (_GradientBoost != 0)
+    {
+        const int S = 8;
+        int samples = 0; float gradSum = 0;
+        for (int sy=0; sy<S; sy++)
+        for (int sx=0; sx<S; sx++)
+        {
+            float2 t = float2((sx+0.5)/S, (sy+0.5)/S);
+            float2 uv = lerp(_NodeUVMin.xy, _NodeUVMax.xy, t);
+            float2 du = float2(1.0/(_VertsPerSide-1), 0);
+            float2 dv = float2(0, 1.0/(_VertsPerSide-1));
+            float hx = _HeightRG.SampleLevel(sampLinear, uv+du, 0).x - _HeightRG.SampleLevel(sampLinear, uv-du, 0).x;
+            float hz = _HeightRG.SampleLevel(sampLinear, uv+dv, 0).x - _HeightRG.SampleLevel(sampLinear, uv-dv, 0).x;
+            float g = sqrt(hx*hx + hz*hz) * _HeightScale;
+            gradSum += g; samples++;
+        }
+        float gradAvg = (samples>0) ? (gradSum / samples) : 0;
+        if (gradAvg > _GradientBoostThresholds.x) stride = max(1, stride/2);
+        if (gradAvg > _GradientBoostThresholds.y) stride = max(1, stride/2);
+    }
+    _Stride[0] = max(1, stride);
+}
+
+float SampleHeight(float2 uv) { return _HeightRG.SampleLevel(sampLinear, uv, 0).x * _HeightScale + _HeightOffset; }
+
+[numthreads(8,8,1)]
+void BuildNodeVertices(uint3 id : SV_DispatchThreadID)
+{
+    int N = _VertsPerSide;
+    if (id.x >= N || id.y >= N) return;
+    int idx = id.y * N + id.x;
+
+    float2 t = float2(id.x, id.y) / (N - 1);
+    float2 uv = lerp(_NodeUVMin.xy, _NodeUVMax.xy, t);
+    float y = SampleHeight(uv);
+    float3 p = float3(t.x * _NodeSize, y, t.y * _NodeSize);
+    _Positions[idx] = p;
+
+    float2 du = float2(1.0/(N-1), 0);
+    float2 dv = float2(0, 1.0/(N-1));
+    float hx = _HeightRG.SampleLevel(sampLinear, uv+du, 0).x - _HeightRG.SampleLevel(sampLinear, uv-du, 0).x;
+    float hz = _HeightRG.SampleLevel(sampLinear, uv+dv, 0).x - _HeightRG.SampleLevel(sampLinear, uv-dv, 0).x;
+    float3 dx = float3(1, hx*_HeightScale, 0);
+    float3 dz = float3(0, hz*_HeightScale, 1);
+    float3 n = normalize(cross(dz, dx));
+    _Normals[idx] = n;
+
+    if (_EnableSkirts != 0)
+    {
+        int baseSkirt = N*N;
+
+        if (id.x==0)
+        {
+            int sidx = baseSkirt + id.y;
+            float2 suv = lerp(_NodeUVMin.xy, _NodeUVMax.xy, float2(0, t.y));
+            float sy = SampleHeight(suv) - _SkirtHeight;
+            _Positions[sidx] = float3(0, sy, t.y * _NodeSize);
+            _Normals[sidx] = _Normals[id.y * N + 0];
+        }
+        if (id.x==N-1)
+        {
+            int sidx = baseSkirt + N + id.y;
+            float2 suv = lerp(_NodeUVMin.xy, _NodeUVMax.xy, float2(1, t.y));
+            float sy = SampleHeight(suv) - _SkirtHeight;
+            _Positions[sidx] = float3(_NodeSize, sy, t.y * _NodeSize);
+            _Normals[sidx] = _Normals[id.y * N + (N-1)];
+        }
+        if (id.y==0)
+        {
+            int sidx = baseSkirt + 2*N + id.x;
+            float2 suv = lerp(_NodeUVMin.xy, _NodeUVMax.xy, float2(t.x, 0));
+            float sy = SampleHeight(suv) - _SkirtHeight;
+            _Positions[sidx] = float3(t.x * _NodeSize, sy, 0);
+            _Normals[sidx] = _Normals[0 * N + id.x];
+        }
+        if (id.y==N-1)
+        {
+            int sidx = baseSkirt + 3*N + id.x;
+            float2 suv = lerp(_NodeUVMin.xy, _NodeUVMax.xy, float2(t.x, 1));
+            float sy = SampleHeight(suv) - _SkirtHeight;
+            _Positions[sidx] = float3(t.x * _NodeSize, sy, _NodeSize);
+            _Normals[sidx] = _Normals[(N-1) * N + id.x];
+        }
+    }
+}
+
+[numthreads(8,8,1)]
+void BuildNodeIndicesAndArgs(uint3 id : SV_DispatchThreadID)
+{
+    int N = _VertsPerSide;
+    uint stride = _Stride[0];
+    int maxQuadsSide = (N-1);
+    if (id.x >= maxQuadsSide || id.y >= maxQuadsSide) return;
+    if ((id.x % stride) != 0 || (id.y % stride) != 0) return;
+
+    int quadsSide = (N-1) / stride;
+    int cx = id.x / stride;
+    int cy = id.y / stride;
+    int coarseIndex = cy * quadsSide + cx;
+    int baseIdx = coarseIndex * 6;
+
+    int v0 = id.y * N + id.x;
+    int v1 = v0 + stride;
+    int v2 = v0 + stride * N;
+    int v3 = v2 + stride;
+
+    _Indices[baseIdx + 0] = v0;
+    _Indices[baseIdx + 1] = v2;
+    _Indices[baseIdx + 2] = v1;
+    _Indices[baseIdx + 3] = v1;
+    _Indices[baseIdx + 4] = v2;
+    _Indices[baseIdx + 5] = v3;
+
+    if (id.x==0 && id.y==0)
+    {
+        uint gridIndexCount = (uint)(quadsSide * quadsSide * 6);
+        uint writePtr = gridIndexCount;
+
+        if (_EnableSkirts != 0)
+        {
+            int baseSkirt = N*N;
+
+            for (int s=0; s<N-1; s++)
+            {   // LEFT
+                int vTop    = s * N + 0;
+                int vBottom = (s+1) * N + 0;
+                int svTop   = baseSkirt + s;
+                int svBot   = baseSkirt + s + 1;
+                _Indices[writePtr+0] = vTop; _Indices[writePtr+1] = vBottom; _Indices[writePtr+2] = svTop;
+                _Indices[writePtr+3] = svTop; _Indices[writePtr+4] = vBottom; _Indices[writePtr+5] = svBot;
+                writePtr += 6;
+            }
+            for (int s=0; s<N-1; s++)
+            {   // RIGHT
+                int vTop    = s * N + (N-1);
+                int vBottom = (s+1) * N + (N-1);
+                int svTop   = baseSkirt + N + s;
+                int svBot   = baseSkirt + N + s + 1;
+                _Indices[writePtr+0] = vTop; _Indices[writePtr+1] = svTop; _Indices[writePtr+2] = vBottom;
+                _Indices[writePtr+3] = vBottom; _Indices[writePtr+4] = svTop; _Indices[writePtr+5] = svBot;
+                writePtr += 6;
+            }
+            for (int s=0; s<N-1; s++)
+            {   // BOTTOM
+                int vLeft  = 0 * N + s;
+                int vRight = 0 * N + (s+1);
+                int svL    = baseSkirt + 2*N + s;
+                int svR    = baseSkirt + 2*N + s + 1;
+                _Indices[writePtr+0] = vLeft; _Indices[writePtr+1] = svL; _Indices[writePtr+2] = vRight;
+                _Indices[writePtr+3] = vRight; _Indices[writePtr+4] = svL; _Indices[writePtr+5] = svR;
+                writePtr += 6;
+            }
+            for (int s=0; s<N-1; s++)
+            {   // TOP
+                int vLeft  = (N-1) * N + s;
+                int vRight = (N-1) * N + (s+1);
+                int svL    = baseSkirt + 3*N + s;
+                int svR    = baseSkirt + 3*N + s + 1;
+                _Indices[writePtr+0] = vLeft; _Indices[writePtr+1] = vRight; _Indices[writePtr+2] = svL;
+                _Indices[writePtr+3] = svL; _Indices[writePtr+4] = vRight; _Indices[writePtr+5] = svR;
+                writePtr += 6;
+            }
+        }
+        _Args[0] = writePtr; _Args[1] = 1; _Args[2] = 0; _Args[3] = 0;
+    }
+}

@@ -1,0 +1,152 @@
+#pragma kernel CSMain
+[numthreads(8,8,1)]
+void CSMain(uint3 id : SV_DispatchThreadID);
+
+struct GpuLayerDesc
+{
+    int type; int compOp; int clampUV; int texSlice;
+    float heightScale, heightOffset, opacity, blendBias;
+    float areaMinX, areaMinY, areaMaxX, areaMaxY;
+    float frequency, persistence, lacunarity, maskThreshold, maskSmooth;
+    int octaves, outputMaskFromHeight, pad0, pad1;
+
+    int noiseType;        // 0..3
+    float warpAmountMeters;
+    float warpFrequency;
+    int terraceSteps;
+    float terraceStrength;
+
+    int maskSlice;  // pre-blurred mask slice (-1 if none)
+    int paintSlice; // painted mask slice (-1 if none)
+    float padA, padB;
+};
+
+RWTexture2D<float2> _Result;
+Texture2DArray<float4> _LayerTexArray;
+Texture2DArray<float>  _LayerMaskArray; // blurred masks (optional)
+Texture2DArray<float>  _PaintMaskArray; // paint masks (optional)
+
+StructuredBuffer<GpuLayerDesc> _Layers;
+int _LayerCount;
+int _Resolution;
+float _TileMeters;
+
+float2 hash2(float2 p){ p = float2(dot(p,float2(127.1,311.7)), dot(p,float2(269.5,183.3))); return frac(sin(p)*43758.5453); }
+float perlin_fallback(float2 p)
+{
+    float2 i = floor(p); float2 f = frac(p);
+    float2 u = f*f*(3-2*f);
+    float2 a = hash2(i + float2(0,0));
+    float2 b = hash2(i + float2(1,0));
+    float2 c = hash2(i + float2(0,1));
+    float2 d = hash2(i + float2(1,1));
+    float n = lerp(lerp(dot(a,f-0), dot(b,f-float2(1,0)), u.x),
+                   lerp(dot(c,f-float2(0,1)), dot(d,f-float2(1,1)), u.x), u.y);
+    return saturate(n*0.5+0.5)*2-1;
+}
+float perlin2(float2 p){ return perlin_fallback(p); }
+float fractal(float2 p,int oct,float pers,float lac)
+{
+    float sum=0,amp=1,freq=1,norm=0;
+    [loop] for(int i=0;i<oct;i++){ sum += amp * perlin2(p*freq); norm += amp; amp *= pers; freq *= lac; }
+    return sum / max(norm, 1e-6);
+}
+float terrace(float t,int steps,float strength){ steps=max(1,steps); float k=floor(t*steps)/steps; return lerp(t,k,saturate(strength)); }
+
+void composite(inout float2 accum, int op, float layerH, float layerM, float bias)
+{
+    float a = saturate(layerM * max(bias, 1e-6));
+    if (a <= 0) return;
+
+    if (op==0) { // Equals
+        accum.x = lerp(accum.x, layerH, a);
+    } else if (op==1) { // Min
+        float v = min(accum.x, layerH);
+        accum.x = lerp(accum.x, v, a);
+    } else if (op==2) { // Max
+        float v = max(accum.x, layerH);
+        accum.x = lerp(accum.x, v, a);
+    } else if (op==3) { // Average
+        float v = 0.5*(accum.x + layerH);
+        accum.x = lerp(accum.x, v, a);
+    } else if (op==4) { // Add
+        accum.x = accum.x + layerH * a;
+    } else if (op==5) { // Subtract
+        accum.x = accum.x - layerH * a;
+    }
+    accum.y = max(accum.y, layerM);
+}
+
+[numthreads(8,8,1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Resolution || id.y >= _Resolution) return;
+
+    float u = (id.x + 0.5) / _Resolution;
+    float v = (id.y + 0.5) / _Resolution;
+    float2 accum = float2(0,0);
+
+    [loop] for (int i=0;i<_LayerCount;i++)
+    {
+        GpuLayerDesc L = _Layers[i];
+        float2 meters = float2(u*_TileMeters, v*_TileMeters);
+
+        bool inside = (meters.x >= L.areaMinX && meters.x <= L.areaMaxX) &&
+                      (meters.y >= L.areaMinY && meters.y <= L.areaMaxY);
+        if (!inside && L.clampUV==0) { continue; }
+
+        float2 A = float2(L.areaMinX, L.areaMinY);
+        float2 S = float2(max(L.areaMaxX-L.areaMinX, 1e-6), max(L.areaMaxY-L.areaMinY, 1e-6));
+        float2 luv = saturate((meters - A) / S);
+
+        float h=0, m=0;
+
+        if (L.type==0) // texture-like
+        {
+            float4 c = _LayerTexArray.SampleLevel(sampler_state{ Filter=MIN_MAG_MIP_LINEAR, AddressU=Clamp, AddressV=Clamp }, float3(luv, max(L.texSlice,0)), 0);
+            h = c.r;
+            if (L.maskSlice >= 0) m = _LayerMaskArray.SampleLevel(sampler_state{ Filter=MIN_MAG_MIP_LINEAR, AddressU=Clamp, AddressV=Clamp }, float3(luv, L.maskSlice), 0).r;
+            else m = c.g;
+        }
+        else // noise
+        {
+            float2 pMeters = meters;
+            if (L.warpAmountMeters>0 && L.noiseType==3)
+            {
+                float2 vvv=0; float amp=1,freq=1;
+                [unroll] for(int k=0;k<2;k++){ float nx=perlin2(meters*freq); float ny=perlin2((meters+float2(19.17,-7.31))*freq); vvv+=float2(nx,ny)*amp; amp*=0.5; freq*=2; }
+                pMeters += vvv * L.warpAmountMeters;
+            }
+            float n = fractal(pMeters*L.frequency, L.octaves, L.persistence, L.lacunarity);
+            if(L.noiseType==1) n=1-abs(n); else if(L.noiseType==2) n=abs(n);
+            float hh = saturate(n*0.5+0.5);
+            if (L.terraceSteps>0) hh=terrace(hh, L.terraceSteps, L.terraceStrength);
+            h = hh;
+            if (L.maskSlice >= 0)
+                m = _LayerMaskArray.SampleLevel(sampler_state{ Filter=MIN_MAG_MIP_LINEAR, AddressU=Clamp, AddressV=Clamp }, float3(luv, L.maskSlice), 0).r;
+            else
+            {
+                if (L.outputMaskFromHeight!=0)
+                {
+                    float t0=saturate(L.maskThreshold - L.maskSmooth);
+                    float t1=saturate(L.maskThreshold + L.maskSmooth);
+                    m = smoothstep(0,1, saturate((hh - t0)/max(t1-t0, 1e-6)));
+                }
+                else m = 1.0;
+            }
+        }
+
+        // Multiply in painted mask if present (and not already baked into blurred mask)
+        if (L.maskSlice < 0 && L.paintSlice >= 0)
+        {
+            float pm = _PaintMaskArray.SampleLevel(sampler_state{ Filter=MIN_MAG_MIP_LINEAR, AddressU=Clamp, AddressV=Clamp }, float3(luv, L.paintSlice), 0).r;
+            m *= pm;
+        }
+
+        h = h * L.heightScale + L.heightOffset;
+        m = saturate(m);
+        composite(accum, L.compOp, h, m, L.blendBias);
+    }
+
+    _Result[int2(id.xy)] = accum;
+}
